@@ -10,14 +10,15 @@ from icecream import ic
 ic(torch.cuda.is_available())  # Check if CUDA is available
 ic(torch.cuda.device_count())
 
-from mast3r.model import AsymmetricMASt3R
-from dust3r.image_pairs import make_pairs
-from dust3r.inference import inference
+from fast3r.dust3r.utils.image import load_images
+from fast3r.dust3r.inference_multiview import inference
+from fast3r.models.fast3r import Fast3R
+from fast3r.models.multiview_dust3r_module import MultiViewDUSt3RLitModule
+from fast3r.dust3r.utils.scene import scene_information
 from dust3r.utils.device import to_numpy
 from dust3r.utils.geometry import inv
-from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
 from utils.sfm_utils import (save_intrinsics, save_extrinsic, save_points3D, save_time, save_images_and_masks,
-                             init_filestructure, get_sorted_image_files, split_train_test, load_images, compute_co_vis_masks)
+                             init_filestructure, get_sorted_image_files, split_train_test, compute_co_vis_masks)
 from utils.camera_utils import generate_interpolated_path
 
 
@@ -26,7 +27,13 @@ def main(source_path, model_path, ckpt_path, device, batch_size, image_size, sch
 
     # ---------------- (1) Load model and images ----------------  
     save_path, sparse_0_path, sparse_1_path = init_filestructure(Path(source_path), n_views)
-    model = AsymmetricMASt3R.from_pretrained(ckpt_path).to(device)
+    model = Fast3R.from_pretrained("jedyang97/Fast3R_ViT_Large_512")  
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    lit_module = MultiViewDUSt3RLitModule.load_for_inference(model)
+    model.eval()
+    lit_module.eval()
+
     image_dir = Path(source_path) / 'images'
     image_files, image_suffix = get_sorted_image_files(image_dir)
     if infer_video:
@@ -39,24 +46,43 @@ def main(source_path, model_path, ckpt_path, device, batch_size, image_size, sch
     images, org_imgs_shape = load_images(image_files, size=image_size)
 
     start_time = time()
-    print(f'>> Making pairs...')
-    pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
     print(f'>> Inference...')
-    output = inference(pairs, model, device, batch_size=1, verbose=True)
-    print(f'>> Global alignment...')
-    scene = global_aligner(output, device=args.device, mode=GlobalAlignerMode.PointCloudOptimizer)
-    loss = scene.compute_global_alignment(init="mst", niter=300, schedule=schedule, lr=lr, focal_avg=args.focal_avg)
-
+    output, profiling_info = inference(
+        images,
+        model,
+        device,
+        dtype=torch.float32,  # or use torch.bfloat16 if supported
+        verbose=True,
+        profiling=True,
+    )
+    
+    lit_module.align_local_pts3d_to_global(
+        preds=output['preds'],
+        views=output['views'],
+        min_conf_thr_percentile=85
+    )
+    
+    poses_c2w_batch, estimated_focals = MultiViewDUSt3RLitModule.estimate_camera_poses(
+        output['preds'],
+        niter_PnP=100,
+        focal_length_estimation_method='first_view_from_global_head'
+    )
+   
+    rgbimg, pts3d, conf, intrinsics_raw, depthmaps_raw, focals=scene_information(output,images,estimated_focals[0][0])
+    
     # Extract scene information
-    extrinsics_w2c = inv(to_numpy(scene.get_im_poses()))
-    intrinsics = to_numpy(scene.get_intrinsics())
-    focals = to_numpy(scene.get_focals())
-    imgs = np.array(scene.imgs)
-    print(f"image range from {imgs.min()} to {imgs.max()}")
-    pts3d = to_numpy(scene.get_pts3d())
+    poses_c2w_batch_np=np.array(poses_c2w_batch).squeeze(axis=0)
+    extrinsics_w2c = inv(to_numpy(poses_c2w_batch_np))
     pts3d = np.array(pts3d)
-    depthmaps = to_numpy(scene.im_depthmaps.detach().cpu().numpy())
-    values = [param.detach().cpu().numpy() for param in scene.im_conf]
+    N = pts3d.shape[0]
+    intrinsics= intrinsics_raw.unsqueeze(0).repeat(N, 1, 1)
+    intrinsics = to_numpy(intrinsics)
+    focals=to_numpy(focals)
+    imgs = np.array(rgbimg)
+    print(f"image range from {imgs.min()} to {imgs.max()}")
+    depthmaps_raw = np.array(depthmaps_raw)
+    depthmaps= depthmaps_raw.reshape(depthmaps_raw.shape[0], -1)
+    values = [param.detach().cpu().numpy() for param in conf]
     confs = np.array(values)
     
     if conf_aware_ranking:
@@ -86,7 +112,6 @@ def main(source_path, model_path, ckpt_path, device, batch_size, image_size, sch
         print_type_and_shape("extrinsics_w2c", extrinsics_w2c)
         print_type_and_shape("imgs", imgs)
         print_type_and_shape("depth_threshold", depth_thre)
-        print_type_and_shape("focals", focals)
         overlapping_masks = compute_co_vis_masks(sorted_conf_indices, depthmaps, pts3d, intrinsics, extrinsics_w2c, imgs.shape, depth_threshold=depth_thre)
         overlapping_masks = ~overlapping_masks
     else:
@@ -139,7 +164,7 @@ def main(source_path, model_path, ckpt_path, device, batch_size, image_size, sch
     save_intrinsics(sparse_0_path, focals, org_imgs_shape, imgs.shape, save_focals=True)
     pts_num = save_points3D(sparse_0_path, imgs, pts3d, confs.reshape(pts3d.shape[0], -1), overlapping_masks, use_masks=co_vis_dsp, save_all_pts=True, save_txt_path=model_path, depth_threshold=depth_thre)
     save_images_and_masks(sparse_0_path, n_views, imgs, overlapping_masks, image_files, image_suffix)
-    print(f'[INFO] MASt3R Reconstruction is successfully converted to COLMAP files in: {str(sparse_0_path)}')
+    print(f'[INFO] Fast3R Reconstruction is successfully converted to COLMAP files in: {str(sparse_0_path)}')
     print(f'[INFO] Number of points: {pts3d.reshape(-1, 3).shape[0]}')    
     print(f'[INFO] Number of points after downsampling: {pts_num}')
 

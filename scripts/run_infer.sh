@@ -1,20 +1,20 @@
 #!/bin/bash
 
 # Change the absolute path first!
-DATA_ROOT_DIR="<Absolute_Path>/InstantSplat/assets"
-OUTPUT_DIR="output_infer"
+DATA_ROOT_DIR="/home/wherami/InstantSplat/assets"
+OUTPUT_DIR="output"
 DATASETS=(
-    sora
+    hkust
 )
 
 SCENES=(
-    Santorini
-    Art 
+    Office
 )
 
 N_VIEWS=(
-    3
+    45
 )
+MODEL="fast3r"
 
 gs_train_iter=1000
 
@@ -36,7 +36,7 @@ run_on_gpu() {
     SOURCE_PATH=${DATA_ROOT_DIR}/${DATASET}/${SCENE}/
     GT_POSE_PATH=${DATA_ROOT_DIR}/${DATASET}/${SCENE}/
     IMAGE_PATH=${SOURCE_PATH}images
-    MODEL_PATH=./${OUTPUT_DIR}/${DATASET}/${SCENE}/${N_VIEW}_views
+    MODEL_PATH=./${OUTPUT_DIR}/${MODEL}/${DATASET}/${SCENE}/${N_VIEW}_views
 
     # Create necessary directories
     mkdir -p ${MODEL_PATH}
@@ -47,7 +47,7 @@ run_on_gpu() {
 
     # (1) Co-visible Global Geometry Initialization
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting Co-visible Global Geometry Initialization..."
-    CUDA_VISIBLE_DEVICES=${GPU_ID} python -W ignore ./init_geo.py \
+    CUDA_VISIBLE_DEVICES=${GPU_ID} python -W ignore ./init_geo_fast3r.py \
     -s ${SOURCE_PATH} \
     -m ${MODEL_PATH} \
     --n_views ${N_VIEW} \
